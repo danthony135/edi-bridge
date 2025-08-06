@@ -18,9 +18,10 @@ def verify_token():
 
 def create_sale_order(po_data):
     try:
-        db = ODOO_URL.split("//")[1].split(".")[0]
-        common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
-        uid = common.authenticate(db, ODOO_USERNAME, ODOO_PASSWORD, {})
+db = os.getenv("ODOO_DB")
+common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
+uid = common.authenticate(db, ODOO_USERNAME, ODOO_PASSWORD, {})
+
 
         models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
 
