@@ -1,96 +1,86 @@
+
 from flask import Flask, request, jsonify
 import os
-import requests
-import logging
+import xmlrpc.client
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
+# Environment variables
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY")
 
-@app.route("/", methods=["GET"])
-def index():
-    return "EDI Bridge is running"
+def get_odoo_client():
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    return uid, models
+
+@app.route("/")
+def health():
+    return jsonify({"status": "ok"})
 
 @app.route("/incoming/850", methods=["POST"])
 def receive_850():
-    auth = request.headers.get("Authorization")
-    if auth != "Bearer test1234":
-        return jsonify({"error": "Unauthorized"}), 401
-
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+
         po_number = data.get("po_number")
-        customer_name = data.get("customer", {}).get("name")
-        items = data.get("line_items", [])
+        customer_info = data.get("customer", {})
+        line_items = data.get("line_items", [])
 
-        logging.info(f"Received 850: PO {po_number} for {customer_name}")
+        if not po_number or not customer_info.get("name") or not line_items:
+            return jsonify({"error": "Missing PO data"}), 400
 
-        # Step 1: Create or find customer
-        customer = create_or_find_partner(customer_name)
+        uid, models = get_odoo_client()
 
-        # Step 2: Create order lines
+        # Check if customer exists
+        customer_name = customer_info["name"]
+        customer_ids = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'res.partner', 'search', [[['name', '=', customer_name]]])
+        if customer_ids:
+            customer_id = customer_ids[0]
+        else:
+            # Create customer
+            customer_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+                'res.partner', 'create', [{
+                    'name': customer_name,
+                    'email': customer_info.get("email"),
+                    'phone': customer_info.get("phone"),
+                    'street': customer_info.get("address", {}).get("street"),
+                    'city': customer_info.get("address", {}).get("city"),
+                    'state_id': None,
+                    'zip': customer_info.get("address", {}).get("zip"),
+                    'country_id': None,
+                }])
+
+        # Create sale order
         order_lines = []
-        for item in items:
-            product = find_product_by_sku(item.get("sku"))
-            if not product:
-                continue
+        for item in line_items:
             order_lines.append((0, 0, {
-                "product_id": product["id"],
-                "product_uom_qty": item.get("quantity", 1),
-                "price_unit": item.get("price", 0.0),
-                "name": item.get("description", product["display_name"]),
+                'name': item.get("description", item["sku"]),
+                'product_uom_qty': item["quantity"],
+                'price_unit': item["price"],
             }))
 
-        if not order_lines:
-            return jsonify({"error": "No valid products found"}), 400
+        sale_order_id = models.execute_kw(ODOO_DB, uid, ODOO_API_KEY,
+            'sale.order', 'create', [{
+                'partner_id': customer_id,
+                'client_order_ref': po_number,
+                'order_line': order_lines
+            }])
 
-        # Step 3: Create sale order
-        order = create_sale_order(po_number, customer["id"], order_lines)
+        return jsonify({
+            "status": "success",
+            "sale_order_id": sale_order_id,
+            "po_number": po_number
+        })
 
-        return jsonify({"status": "success", "sale_order_id": order["id"]})
     except Exception as e:
-        logging.exception("Error processing 850")
         return jsonify({"error": str(e)}), 500
 
-def odoo_rpc(model, method, args, kwargs=None):
-    url = f"{ODOO_URL}/jsonrpc"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "service": "object",
-            "method": "execute_kw",
-            "args": [ODOO_DB, ODOO_USER, ODOO_API_KEY, model, method, args, kwargs or {}]
-        },
-        "id": 1,
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    response.raise_for_status()
-    return response.json()["result"]
-
-def create_or_find_partner(name):
-    partners = odoo_rpc("res.partner", "search_read", [[["name", "=", name]]], {"limit": 1})
-    if partners:
-        return partners[0]
-    partner_id = odoo_rpc("res.partner", "create", [{"name": name}])
-    return {"id": partner_id, "name": name}
-
-def find_product_by_sku(sku):
-    products = odoo_rpc("product.product", "search_read", [[["default_code", "=", sku]]], {"limit": 1})
-    return products[0] if products else None
-
-def create_sale_order(po_number, partner_id, lines):
-    return odoo_rpc("sale.order", "create", [{
-        "partner_id": partner_id,
-        "client_order_ref": po_number,
-        "order_line": lines
-    }])
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
