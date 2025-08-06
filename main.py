@@ -15,53 +15,11 @@ def verify_token():
     auth_header = request.headers.get("Authorization", "")
     return auth_header == f"Bearer {API_TOKEN}"
 
-def create_sale_order(po_data):
-    try:
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-        if not uid:
-            return "Authentication with Odoo failed."
-
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-
-        # Find or create customer
-        customer = po_data.get("customer", {})
-        partner_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-            "res.partner", "search", [[["email", "=", customer.get("email")]]])
-        if not partner_ids:
-            partner_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-                "res.partner", "create", [{
-                    "name": customer.get("name"),
-                    "email": customer.get("email")
-                }])
-        else:
-            partner_id = partner_ids[0]
-
-        # Build order lines
-        lines = []
-        for item in po_data.get("lines", []):
-            sku = item.get("sku")
-            product_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-                "product.product", "search", [[["default_code", "=", sku]]], {"limit": 1})
-            if not product_ids:
-                raise Exception(f"Product not found: {sku}")
-            lines.append((0, 0, {
-                "product_id": product_ids[0],
-                "product_uom_qty": item.get("qty"),
-                "price_unit": item.get("price")
-            }))
-
-        # Create the sale order
-        order_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "create", [{
-                "partner_id": partner_id,
-                "origin": po_data.get("po_number"),
-                "date_order": po_data.get("order_date"),
-                "order_line": lines
-            }])
-        return order_id
-    except Exception as e:
-        return f"Error: {str(e)}"
+def create_odoo_connection():
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    return uid, models
 
 @app.route("/incoming/850", methods=["POST"])
 def handle_850():
@@ -82,19 +40,63 @@ def handle_860():
 def send_855():
     if not verify_token():
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"status": "sent", "ack": True})
+    try:
+        uid, models = create_odoo_connection()
+        order_id = request.json.get("order_id")
+        order = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "read", [order_id], {"fields": ["name", "date_order", "order_line"]})[0]
+        line_ids = order["order_line"]
+        lines = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order.line", "read", [line_ids], {"fields": ["product_id", "product_uom_qty"]})
+        items = [{"sku": l["product_id"][1], "qty": l["product_uom_qty"], "status": "accepted"} for l in lines]
+        payload = {
+            "po_number": order["name"],
+            "acknowledged": True,
+            "order_date": order["date_order"],
+            "items": items
+        }
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/outgoing/856", methods=["POST"])
 def send_856():
     if not verify_token():
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"status": "sent", "asn": True})
+    try:
+        uid, models = create_odoo_connection()
+        picking_id = request.json.get("picking_id")
+        picking = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "stock.picking", "read", [picking_id], {"fields": ["name", "carrier_id", "scheduled_date", "move_ids_without_package"]})[0]
+        lines = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "read", [picking["move_ids_without_package"]], {"fields": ["product_id", "product_uom_qty"]})
+        items = [{"sku": l["product_id"][1], "qty": l["product_uom_qty"]} for l in lines]
+        payload = {
+            "shipment_id": picking["name"],
+            "carrier": picking["carrier_id"][1] if picking["carrier_id"] else "N/A",
+            "ship_date": picking["scheduled_date"],
+            "items": items
+        }
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/outgoing/810", methods=["POST"])
 def send_810():
     if not verify_token():
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify({"status": "sent", "invoice": True})
+    try:
+        uid, models = create_odoo_connection()
+        invoice_id = request.json.get("invoice_id")
+        invoice = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "account.move", "read", [invoice_id], {"fields": ["name", "invoice_date", "amount_total", "invoice_line_ids", "invoice_origin"]})[0]
+        lines = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "account.move.line", "read", [invoice["invoice_line_ids"]], {"fields": ["product_id", "quantity", "price_unit"]})
+        items = [{"sku": l["product_id"][1], "qty": l["quantity"], "price": l["price_unit"]} for l in lines if l["product_id"]]
+        payload = {
+            "invoice_number": invoice["name"],
+            "po_number": invoice["invoice_origin"],
+            "date": invoice["invoice_date"],
+            "total": invoice["amount_total"],
+            "items": items
+        }
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
